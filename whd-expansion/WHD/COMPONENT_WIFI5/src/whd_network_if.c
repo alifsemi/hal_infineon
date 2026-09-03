@@ -71,7 +71,21 @@
  */
 whd_result_t whd_network_process_ethernet_data(whd_interface_t ifp, whd_buffer_t buffer)
 {
-    whd_driver_t whd_driver = ifp->whd_driver;
+    whd_driver_t whd_driver;
+
+    /* P2P GO: BDC may tag ifidx≠bsscfg; callers must resolve ifp first.
+     * Never dereference a NULL ifp (Usage/BusFault on SoftAP EAPOL). */
+    if (ifp == NULL || buffer == NULL) {
+        WPRINT_WHD_ERROR( ("whd_network_process_ethernet_data: NULL ifp/buffer\n") );
+        return WHD_BADARG;
+    }
+
+    whd_driver = ifp->whd_driver;
+    if (whd_driver == NULL || whd_driver->network_if == NULL) {
+        WPRINT_WHD_ERROR( ("whd_network_process_ethernet_data: NULL driver\n") );
+        return WHD_BADARG;
+    }
+
     if (whd_driver->network_if->whd_network_process_ethernet_data)
     {
         whd_driver->network_if->whd_network_process_ethernet_data(ifp, buffer);

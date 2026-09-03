@@ -391,8 +391,22 @@ whd_result_t whd_wifi_init_ap(whd_interface_t ifp, whd_ssid_t *ssid, whd_securit
 
     if ( (result = whd_wifi_set_mac_address(ifp, ifp->mac_addr) ) != WHD_SUCCESS )
     {
-        WPRINT_WHD_INFO ( (" Set AP MAC address failed result=%" PRIu32 "\n", result) );
+        /*
+         * CYW43439 SoftAP on bsscfg2 (concurrent with p2p_disc on bsscfg1)
+         * often rejects cur_etheraddr (WHD_WLAN_ERROR). Firmware already
+         * assigned a MAC via WLC_E_IF — continue SoftAP bring-up.
+         */
+        WPRINT_WHD_INFO ( (" Set AP MAC address failed result=%" PRIu32
+                           " (bsscfg=%u) — continuing\n",
+                           result, (unsigned)ifp->bsscfgidx) );
+#ifdef WHD_ZEPHYR
+        if (ifp->bsscfgidx < 2)
+        {
+            return result;
+        }
+#else
         return result;
+#endif
     }
 
     /* Set the SSID */
@@ -418,7 +432,26 @@ whd_result_t whd_wifi_init_ap(whd_interface_t ifp, whd_ssid_t *ssid, whd_securit
     }
 
     /* Set the chanspec */
-    CHECK_RETURN_WITH_SEMAPHORE(whd_wifi_set_chanspec(ifp, CH20MHZ_CHSPEC(chanspec) ), &ap->whd_wifi_sleep_flag);
+    result = whd_wifi_set_chanspec(ifp, CH20MHZ_CHSPEC(chanspec) );
+    if (result != WHD_SUCCESS)
+    {
+#ifdef WHD_ZEPHYR
+        /*
+         * A P2P GO bsscfg created by p2p_ifadd is already fixed to its
+         * chanspec and firmware refuses to set it again.
+         */
+        if (ifp->bsscfgidx >= 2)
+        {
+            WPRINT_WHD_INFO ( (" Set chanspec failed result=%" PRIu32
+                               " (bsscfg=%u) — already set by p2p_ifadd\n",
+                               result, (unsigned)ifp->bsscfgidx) );
+        }
+        else
+#endif
+        {
+            CHECK_RETURN_WITH_SEMAPHORE(result, &ap->whd_wifi_sleep_flag);
+        }
+    }
 
     data = (uint32_t *)whd_proto_get_iovar_buffer(whd_driver, &buffer, (uint16_t)8, "bsscfg:" IOVAR_STR_WSEC);
     CHECK_IOCTL_BUFFER_WITH_SEMAPHORE(data, &ap->whd_wifi_sleep_flag);
