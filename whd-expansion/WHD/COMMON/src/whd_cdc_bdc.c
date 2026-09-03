@@ -172,7 +172,14 @@ whd_result_t whd_cdc_send_ioctl(whd_interface_t ifp, cdc_command_type_t type, ui
     whd_result_t retval;
     control_header_t *send_packet;
     cdc_header_t *cdc_header;
-    uint32_t bss_index = ifp->bsscfgidx;
+    /*
+     * CDCF_IOC_IF carries the firmware interface index, which is only equal to
+     * the bsscfg index for the primary and secondary interfaces. A P2P bsscfg
+     * created by p2p_ifadd is reported by firmware as a lower ifidx than its
+     * bsscfg index, and addressing it by bsscfg index makes firmware reject
+     * every command for a non-existent interface.
+     */
+    uint32_t bss_index = ifp->ifidx;
     whd_driver_t whd_driver = ifp->whd_driver;
     whd_cdc_bdc_info_t *cdc_bdc_info = whd_driver->proto->pd;
 #ifdef BUS_ENC
@@ -492,7 +499,7 @@ whd_result_t whd_cdc_tx_queue_data(whd_interface_t ifp, whd_buffer_t buffer)
         packet->bdc_header.priority = priority;
     }
 
-    packet->bdc_header.flags2   = ifp->bsscfgidx;
+    packet->bdc_header.flags2   = ifp->ifidx;
 #ifdef BUS_ENC
     packet->bdc_header.flags2   |= (BDC_FLAG2_ENC << BDC_FLAG2_ENC_SHIFT);
 #endif /*BUS_ENC */
@@ -713,10 +720,15 @@ void whd_process_bdc(whd_driver_t whd_driver, whd_buffer_t buffer)
     mbedtls_gcm_setkey( &ctx, cipher, whd_driver->key, GCM_KEY_SIZE );
 #endif /* BUS_ENC */
     bdc_header_t *bdc_header = (bdc_header_t *)whd_buffer_get_current_piece_data_pointer(whd_driver, buffer);
+    uint8_t bdc_flags2;
+    uint8_t bdc_data_offset;
     CHECK_PACKET_WITH_NULL_RETURN(bdc_header);
+    /* Capture before pull — do not read through bdc_header after add_remove */
+    bdc_flags2 = bdc_header->flags2;
+    bdc_data_offset = bdc_header->data_offset;
     /* Calculate where the payload is */
     headers_len_below_payload =
-        (int32_t)( (int32_t)BDC_HEADER_LEN + (int32_t)(bdc_header->data_offset << 2) );
+        (int32_t)( (int32_t)BDC_HEADER_LEN + (int32_t)(bdc_data_offset << 2) );
 
     /* Move buffer pointer past gSPI, BUS, BCD headers and padding,
      * so that the network stack or 802.11 monitor sees only the payload */
@@ -731,7 +743,7 @@ void whd_process_bdc(whd_driver_t whd_driver, whd_buffer_t buffer)
     }
 
 #ifdef BUS_ENC
-    if ((bdc_header->flags2 & BDC_FLAG2_ENC_MASK) == BDC_FLAG2_ENC_MASK)
+    if ((bdc_flags2 & BDC_FLAG2_ENC_MASK) == BDC_FLAG2_ENC_MASK)
     {
 	int ret = 0;
 	uint8_t *out;
@@ -756,8 +768,56 @@ void whd_process_bdc(whd_driver_t whd_driver, whd_buffer_t buffer)
     }
 
     WPRINT_WHD_DATA_LOG( ("Wcd:< Procd pkt 0x%08lX\n", (unsigned long)buffer) );
-    bssid_index = (uint32_t)(bdc_header->flags2 & BDC_FLAG2_IF_MASK);
-    ifp = whd_driver->iflist[bssid_index];
+    /*
+     * BDC flags2 carries the firmware ifidx. Host stores interfaces in
+     * iflist[bsscfgidx]; for P2P GO (bsscfg2 / ifidx1) those differ.
+     * Resolve by if2ifp[] then by matching ifp->ifidx.
+     */
+    bssid_index = (uint32_t)(bdc_flags2 & BDC_FLAG2_IF_MASK);
+    ifp = NULL;
+    if (bssid_index < WHD_INTERFACE_MAX) {
+        uint8_t mapped = whd_driver->if2ifp[bssid_index];
+
+        if (mapped < WHD_INTERFACE_MAX &&
+            whd_driver->iflist[mapped] != NULL &&
+            whd_driver->iflist[mapped]->ifidx == (uint8_t)bssid_index) {
+            ifp = whd_driver->iflist[mapped];
+        } else if (whd_driver->iflist[bssid_index] != NULL) {
+            ifp = whd_driver->iflist[bssid_index];
+        } else {
+            uint8_t i;
+
+            for (i = 0; i < WHD_INTERFACE_MAX; i++) {
+                if (whd_driver->iflist[i] != NULL &&
+                    whd_driver->iflist[i]->ifidx == (uint8_t)bssid_index) {
+                    ifp = whd_driver->iflist[i];
+                    break;
+                }
+            }
+        }
+    }
+    /* Last resort: any SoftAP/GO role (P2P tertiary) */
+    if (ifp == NULL) {
+        uint8_t i;
+
+        for (i = 0; i < WHD_INTERFACE_MAX; i++) {
+            if (whd_driver->iflist[i] != NULL &&
+                whd_driver->iflist[i]->role == WHD_AP_ROLE) {
+                ifp = whd_driver->iflist[i];
+                break;
+            }
+        }
+    }
+
+    if (ifp == NULL) {
+        WPRINT_WHD_ERROR( ("BDC RX: no ifp for ifidx=%u — dropping\n",
+                           (unsigned)bssid_index) );
+        result = whd_buffer_release(whd_driver, buffer, WHD_NETWORK_RX);
+        if (result != WHD_SUCCESS)
+            WPRINT_WHD_ERROR( ("buffer release failed in %s at %d \n",
+                               __func__, __LINE__) );
+        return;
+    }
 
     /* Send packet to bottom of network stack */
     result = whd_network_process_ethernet_data(ifp, buffer);
